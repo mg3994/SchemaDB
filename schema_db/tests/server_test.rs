@@ -21,7 +21,7 @@ async fn test_server_integration() {
     let definitions = Arc::new(SchemaDefinitions::parse(schema_json).unwrap());
     let storage = Arc::new(Storage::new("./test_server_data", definitions.clone()).unwrap());
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8901").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8902").await.unwrap();
 
     let storage_clone = storage.clone();
     let definitions_clone = definitions.clone();
@@ -32,7 +32,7 @@ async fn test_server_integration() {
     });
 
     // Client
-    let mut stream = TcpStream::connect("127.0.0.1:8901").await.unwrap();
+    let mut stream = TcpStream::connect("127.0.0.1:8902").await.unwrap();
 
     // Insert Alice
     let req = Request::Insert {
@@ -61,6 +61,10 @@ async fn test_server_integration() {
         r#type: "Person".to_string(),
         filters,
         hydrate: Some(false),
+        limit: None,
+        offset: None,
+        sort_by: None,
+        sort_desc: None,
     };
     send_req(&mut stream, &req).await;
     let resp = recv_resp(&mut stream).await;

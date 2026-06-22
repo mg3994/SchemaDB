@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
 
-pub async fn handle_client(mut stream: TcpStream, storage: Arc<Storage>, definitions: Arc<SchemaDefinitions>) {
+pub async fn handle_client(stream: TcpStream, storage: Arc<Storage>, definitions: Arc<SchemaDefinitions>) {
     let (mut reader, mut writer) = stream.into_split();
 
     loop {
@@ -98,8 +98,8 @@ pub async fn handle_client(mut stream: TcpStream, storage: Arc<Storage>, definit
                     Err(e) => Response::Error { message: e.to_string() },
                 }
             }
-            Request::GetByType { r#type, hydrate } => {
-                match storage.get_by_type(&r#type) {
+            Request::GetByType { r#type, hydrate, limit, offset, sort_by, sort_desc } => {
+                match storage.get_by_type_advanced(&r#type, limit, offset, sort_by.as_deref(), sort_desc.unwrap_or(false)) {
                     Ok(items) => {
                         let mut items = items;
                         if let Some(true) = hydrate {
@@ -116,8 +116,8 @@ pub async fn handle_client(mut stream: TcpStream, storage: Arc<Storage>, definit
                     Err(e) => Response::Error { message: e.to_string() },
                 }
             }
-            Request::Query { r#type, filters, hydrate } => {
-                match storage.query(&r#type, &filters) {
+            Request::Query { r#type, filters, hydrate, limit, offset, sort_by, sort_desc } => {
+                match storage.query_advanced(&r#type, &filters, limit, offset, sort_by.as_deref(), sort_desc.unwrap_or(false)) {
                     Ok(items) => {
                         let mut items = items;
                         if let Some(true) = hydrate {

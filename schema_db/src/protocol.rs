@@ -8,8 +8,23 @@ pub enum Request {
     Insert { data: Value },
     BatchInsert { data: Vec<Value> },
     GetById { id: String, hydrate: Option<bool> },
-    GetByType { r#type: String, hydrate: Option<bool> },
-    Query { r#type: String, filters: HashMap<String, Value>, hydrate: Option<bool> },
+    GetByType {
+        r#type: String,
+        hydrate: Option<bool>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        sort_by: Option<String>,
+        sort_desc: Option<bool>,
+    },
+    Query {
+        r#type: String,
+        filters: HashMap<String, Value>,
+        hydrate: Option<bool>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        sort_by: Option<String>,
+        sort_desc: Option<bool>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

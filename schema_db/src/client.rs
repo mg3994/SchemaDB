@@ -56,8 +56,23 @@ impl SchemaDbClient {
         }
     }
 
-    pub async fn get_by_type(&mut self, r#type: String, hydrate: bool) -> io::Result<Vec<Value>> {
-        match self.send_request(Request::GetByType { r#type, hydrate: Some(hydrate) }).await? {
+    pub async fn get_by_type(
+        &mut self,
+        r#type: String,
+        hydrate: bool,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        sort_by: Option<String>,
+        sort_desc: Option<bool>,
+    ) -> io::Result<Vec<Value>> {
+        match self.send_request(Request::GetByType {
+            r#type,
+            hydrate: Some(hydrate),
+            limit,
+            offset,
+            sort_by,
+            sort_desc,
+        }).await? {
             Response::Ok { data: Some(Value::Array(items)) } => Ok(items),
             Response::Ok { data: None } => Ok(vec![]),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
@@ -65,8 +80,25 @@ impl SchemaDbClient {
         }
     }
 
-    pub async fn query(&mut self, r#type: String, filters: HashMap<String, Value>, hydrate: bool) -> io::Result<Vec<Value>> {
-        match self.send_request(Request::Query { r#type, filters, hydrate: Some(hydrate) }).await? {
+    pub async fn query(
+        &mut self,
+        r#type: String,
+        filters: HashMap<String, Value>,
+        hydrate: bool,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        sort_by: Option<String>,
+        sort_desc: Option<bool>,
+    ) -> io::Result<Vec<Value>> {
+        match self.send_request(Request::Query {
+            r#type,
+            filters,
+            hydrate: Some(hydrate),
+            limit,
+            offset,
+            sort_by,
+            sort_desc,
+        }).await? {
             Response::Ok { data: Some(Value::Array(items)) } => Ok(items),
             Response::Ok { data: None } => Ok(vec![]),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),

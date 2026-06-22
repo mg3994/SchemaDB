@@ -17,7 +17,6 @@ impl Storage {
         let db = sled::open(path)?;
         let cache = Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap()));
 
-        // Persist definitions if they don't exist to ensure stable IDs
         let defs_tree = db.open_tree("internal:definitions")?;
         if defs_tree.is_empty() {
             for (term, id) in &definitions.term_to_id {
@@ -122,31 +121,21 @@ impl Storage {
         };
 
         let compressed = self.compress(&data);
-        let bytes = serde_json::to_vec(&compressed)?;
+        // Using Bincode for super speed binary internal storage
+        let bytes = bincode::serialize(&compressed)?;
         self.db.insert(id.as_bytes(), bytes)?;
 
-        // Update cache
         {
             let mut cache = self.cache.lock().unwrap();
             cache.put(id.clone(), data.clone());
         }
 
-        // Secondary Indexing (Single tree per property for scalability)
         if let Some(obj) = data.as_object() {
             for (key, val) in obj {
-                let index_name = if key == "@type" {
-                    "type".to_string()
-                } else {
-                    format!("idx:{}", key)
-                };
+                let index_name = if key == "@type" { "type".to_string() } else { format!("idx:{}", key) };
+                let idx_tree = self.db.open_tree(&index_name)?;
 
-                let idx_tree = self.db.open_tree(index_name)?;
-
-                let vals = if let Some(arr) = val.as_array() {
-                    arr.clone()
-                } else {
-                    vec![val.clone()]
-                };
+                let vals = if let Some(arr) = val.as_array() { arr.clone() } else { vec![val.clone()] };
 
                 for v in vals {
                     if v.is_string() || v.is_number() || v.is_boolean() {
@@ -154,10 +143,20 @@ impl Storage {
                             Value::String(s) => s.clone(),
                             _ => v.to_string(),
                         };
-                        // Key format: [value][id] to allow range scans and multiple IDs per value
                         let mut idx_key = val_str.as_bytes().to_vec();
+                        idx_key.push(0);
                         idx_key.extend_from_slice(id.as_bytes());
                         idx_tree.insert(idx_key, b"")?;
+
+                        let card_tree = self.db.open_tree("internal:cardinality")?;
+                        card_tree.fetch_and_update(index_name.as_bytes(), |old| {
+                            let count = old.map(|b| {
+                                let mut arr = [0u8; 8];
+                                arr.copy_from_slice(&b);
+                                u64::from_be_bytes(arr)
+                            }).unwrap_or(0);
+                            Some((count + 1).to_be_bytes().to_vec())
+                        })?;
                     }
                 }
             }
@@ -167,7 +166,6 @@ impl Storage {
     }
 
     pub fn get_by_id(&self, id: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
-        // Try cache first
         {
             let mut cache = self.cache.lock().unwrap();
             if let Some(val) = cache.get(id) {
@@ -176,13 +174,11 @@ impl Storage {
         }
 
         if let Some(bytes) = self.db.get(id.as_bytes())? {
-            let compressed: Value = serde_json::from_slice(&bytes)?;
+            // Deserialize from Bincode
+            let compressed: Value = bincode::deserialize(&bytes)?;
             let decompressed = self.decompress(&compressed);
-
-            // Populate cache
             let mut cache = self.cache.lock().unwrap();
             cache.put(id.to_string(), decompressed.clone());
-
             Ok(Some(decompressed))
         } else {
             Ok(None)
@@ -190,61 +186,111 @@ impl Storage {
     }
 
     pub fn get_by_type(&self, typ: &str) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+        self.get_by_type_advanced(typ, None, None, None, false)
+    }
+
+    pub fn get_by_type_advanced(&self, typ: &str, limit: Option<usize>, offset: Option<usize>, sort_by: Option<&str>, sort_desc: bool) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
         let type_tree = self.db.open_tree("type")?;
         let mut results = Vec::new();
-        // Use prefix scan for the type value
-        for item in type_tree.scan_prefix(typ.as_bytes()) {
+        let mut prefix = typ.as_bytes().to_vec();
+        prefix.push(0);
+        for item in type_tree.scan_prefix(&prefix) {
             let (key, _) = item?;
-            let id_bytes = &key[typ.as_bytes().len()..];
+            let id_bytes = &key[prefix.len()..];
             if let Some(val) = self.get_by_id(std::str::from_utf8(id_bytes)?)? {
                 results.push(val);
             }
         }
+
+        self.apply_sorting_and_pagination(&mut results, limit, offset, sort_by, sort_desc);
         Ok(results)
     }
 
-    pub fn query(&self, typ: &str, filters: &HashMap<String, Value>) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    pub fn query_advanced(&self, typ: &str, filters: &HashMap<String, Value>, limit: Option<usize>, offset: Option<usize>, sort_by: Option<&str>, sort_desc: bool) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
         if !filters.is_empty() {
-            // Pick the first filter to narrow down results using index
-            if let Some((key, val)) = filters.iter().next() {
-                if val.is_string() || val.is_number() || val.is_boolean() {
-                    let val_str = match val {
-                        Value::String(s) => s.clone(),
-                        _ => val.to_string(),
-                    };
-                    let idx_tree = self.db.open_tree(format!("idx:{}", key))?;
-                    let mut results = Vec::new();
-                    for item in idx_tree.scan_prefix(val_str.as_bytes()) {
-                        let (idx_key, _) = item?;
-                        let id_bytes = &idx_key[val_str.as_bytes().len()..];
-                        if let Some(val) = self.get_by_id(std::str::from_utf8(id_bytes)?)? {
-                            // Verify all filters and type match
-                            let mut matches = true;
-                            if let Some(obj) = val.as_object() {
-                                if let Some(typ_val) = obj.get("@type") {
-                                    let types = if let Some(t) = typ_val.as_str() { vec![t] } else if let Some(arr) = typ_val.as_array() { arr.iter().filter_map(|v| v.as_str()).collect() } else { vec![] };
-                                    if !types.contains(&typ) { matches = false; }
-                                } else { matches = false; }
+            let card_tree = self.db.open_tree("internal:cardinality")?;
+            let mut best_filter = None;
+            let mut min_card = u64::MAX;
 
-                                if matches {
-                                    for (k, v) in filters {
-                                        if obj.get(k) != Some(v) { matches = false; break; }
-                                    }
-                                }
+            for (key, val) in filters {
+                if val.is_string() || val.is_number() || val.is_boolean() {
+                    let index_name = format!("idx:{}", key);
+                    let card = card_tree.get(&index_name)?.map(|b| {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&b);
+                        u64::from_be_bytes(arr)
+                    }).unwrap_or(u64::MAX);
+                    if card < min_card {
+                        min_card = card;
+                        best_filter = Some((key, val));
+                    }
+                }
+            }
+
+            if let Some((key, val)) = best_filter {
+                let val_str = match val { Value::String(s) => s.clone(), _ => val.to_string() };
+                let idx_tree = self.db.open_tree(format!("idx:{}", key))?;
+                let mut results = Vec::new();
+                let mut prefix = val_str.as_bytes().to_vec();
+                prefix.push(0);
+                for item in idx_tree.scan_prefix(&prefix) {
+                    let (idx_key, _) = item?;
+                    let id_bytes = &idx_key[prefix.len()..];
+                    if let Some(val) = self.get_by_id(std::str::from_utf8(id_bytes)?)? {
+                        let mut matches = true;
+                        if let Some(obj) = val.as_object() {
+                            if let Some(typ_val) = obj.get("@type") {
+                                let types = if let Some(t) = typ_val.as_str() { vec![t] } else if let Some(arr) = typ_val.as_array() { arr.iter().filter_map(|v| v.as_str()).collect() } else { vec![] };
+                                if !types.contains(&typ) { matches = false; }
                             } else { matches = false; }
 
                             if matches {
-                                results.push(val);
+                                for (k, v) in filters {
+                                    if obj.get(k) != Some(v) { matches = false; break; }
+                                }
                             }
-                        }
+                        } else { matches = false; }
+
+                        if matches { results.push(val); }
                     }
-                    return Ok(results);
                 }
+                self.apply_sorting_and_pagination(&mut results, limit, offset, sort_by, sort_desc);
+                return Ok(results);
             }
         }
 
-        // Fallback to type scan
-        self.get_by_type(typ)
+        let results = self.get_by_type_advanced(typ, None, None, None, false)?;
+        let filtered: Vec<Value> = results.into_iter().filter(|val| {
+            let obj = val.as_object().unwrap();
+            filters.iter().all(|(k, v)| obj.get(k) == Some(v))
+        }).collect();
+
+        let mut final_results = filtered;
+        self.apply_sorting_and_pagination(&mut final_results, limit, offset, sort_by, sort_desc);
+        Ok(final_results)
+    }
+
+    fn apply_sorting_and_pagination(&self, results: &mut Vec<Value>, limit: Option<usize>, offset: Option<usize>, sort_by: Option<&str>, sort_desc: bool) {
+        if let Some(field) = sort_by {
+            results.sort_by(|a, b| {
+                let va = a.get(field).unwrap_or(&Value::Null);
+                let vb = b.get(field).unwrap_or(&Value::Null);
+                let res = va.to_string().cmp(&vb.to_string());
+                if sort_desc { res.reverse() } else { res }
+            });
+        }
+
+        if let Some(off) = offset {
+            if off < results.len() {
+                *results = results.split_off(off);
+            } else {
+                results.clear();
+            }
+        }
+
+        if let Some(lim) = limit {
+            results.truncate(lim);
+        }
     }
 }
 
@@ -253,6 +299,38 @@ mod tests {
     use super::*;
     use crate::definition_parser::SchemaDefinitions;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_exact_type_match() {
+        let json_ld = r#"{ "@graph": [{ "@id": "https://schema.org/Person" }, { "@id": "https://schema.org/PersonalEvent" }] }"#;
+        let defs = Arc::new(SchemaDefinitions::parse(json_ld).unwrap());
+        let dir = tempdir().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap(), defs.clone()).unwrap();
+
+        storage.insert(&serde_json::json!({ "@type": "Person", "name": "Alice" })).unwrap();
+        storage.insert(&serde_json::json!({ "@type": "PersonalEvent", "name": "Party" })).unwrap();
+
+        let results = storage.get_by_type("Person").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["name"], "Alice");
+    }
+
+    #[test]
+    fn test_advanced_query() {
+        let json_ld = r#"{ "@graph": [{ "@id": "https://schema.org/Person" }, { "@id": "https://schema.org/name" }] }"#;
+        let defs = Arc::new(SchemaDefinitions::parse(json_ld).unwrap());
+        let dir = tempdir().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap(), defs.clone()).unwrap();
+
+        storage.insert(&serde_json::json!({ "@type": "Person", "name": "C", "age": 30 })).unwrap();
+        storage.insert(&serde_json::json!({ "@type": "Person", "name": "A", "age": 10 })).unwrap();
+        storage.insert(&serde_json::json!({ "@type": "Person", "name": "B", "age": 20 })).unwrap();
+
+        let results = storage.get_by_type_advanced("Person", Some(2), Some(0), Some("name"), false).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["name"], "A");
+        assert_eq!(results[1]["name"], "B");
+    }
 
     #[test]
     fn test_hydration_cycles() {
@@ -273,6 +351,6 @@ mod tests {
         storage.hydrate(&mut alice, &mut seen);
 
         assert_eq!(alice["knows"]["name"], "Bob");
-        assert_eq!(alice["knows"]["knows"], alice_id); // Cycle broken
+        assert_eq!(alice["knows"]["knows"], alice_id);
     }
 }
