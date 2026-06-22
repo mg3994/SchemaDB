@@ -1,5 +1,7 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct SchemaDefinitions {
@@ -9,6 +11,20 @@ pub struct SchemaDefinitions {
 }
 
 impl SchemaDefinitions {
+    pub async fn fetch_or_load_cache(cache_path: &str, url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let json_ld_str = if Path::new(cache_path).exists() {
+            println!("Loading Schema.org definitions from cache: {}", cache_path);
+            fs::read_to_string(cache_path)?
+        } else {
+            println!("Fetching Schema.org definitions from {}...", url);
+            let response = reqwest::get(url).await?.text().await?;
+            fs::write(cache_path, &response)?;
+            response
+        };
+
+        Self::parse(&json_ld_str)
+    }
+
     pub fn parse(json_ld_str: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let root: Value = serde_json::from_str(json_ld_str)?;
         let mut terms = HashSet::new();
@@ -85,5 +101,20 @@ mod tests {
         let person_id = defs.get_id("Person").expect("Person should have ID");
         let term = defs.get_term(person_id).expect("ID should map back to Person");
         assert_eq!(term, "Person");
+    }
+
+    #[tokio::test]
+    async fn test_cache_logic() {
+        let cache_file = "test_schema_cache.json";
+        let _ = fs::remove_file(cache_file);
+
+        let json_ld = r#"{ "@graph": [{ "@id": "https://schema.org/Person" }] }"#;
+        // Since we can't easily mock reqwest without more effort, we'll just test the load part if file exists
+        fs::write(cache_file, json_ld).unwrap();
+
+        let defs = SchemaDefinitions::fetch_or_load_cache(cache_file, "http://invalid").await.unwrap();
+        assert!(defs.is_valid_term("Person"));
+
+        fs::remove_file(cache_file).unwrap();
     }
 }

@@ -39,15 +39,25 @@ impl SchemaDbClient {
         }
     }
 
-    pub async fn get_by_id(&mut self, id: String) -> io::Result<Option<Value>> {
-        match self.send_request(Request::GetById { id }).await? {
+    pub async fn batch_insert(&mut self, data: Vec<Value>) -> io::Result<Vec<String>> {
+        match self.send_request(Request::BatchInsert { data }).await? {
+            Response::Ok { data: Some(Value::Array(ids)) } => {
+                Ok(ids.into_iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            }
+            Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+            _ => Err(io::Error::new(io::ErrorKind::Other, "Unexpected response")),
+        }
+    }
+
+    pub async fn get_by_id(&mut self, id: String, hydrate: bool) -> io::Result<Option<Value>> {
+        match self.send_request(Request::GetById { id, hydrate: Some(hydrate) }).await? {
             Response::Ok { data } => Ok(data),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
         }
     }
 
-    pub async fn get_by_type(&mut self, r#type: String) -> io::Result<Vec<Value>> {
-        match self.send_request(Request::GetByType { r#type }).await? {
+    pub async fn get_by_type(&mut self, r#type: String, hydrate: bool) -> io::Result<Vec<Value>> {
+        match self.send_request(Request::GetByType { r#type, hydrate: Some(hydrate) }).await? {
             Response::Ok { data: Some(Value::Array(items)) } => Ok(items),
             Response::Ok { data: None } => Ok(vec![]),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
@@ -55,8 +65,8 @@ impl SchemaDbClient {
         }
     }
 
-    pub async fn query(&mut self, r#type: String, filters: HashMap<String, Value>) -> io::Result<Vec<Value>> {
-        match self.send_request(Request::Query { r#type, filters }).await? {
+    pub async fn query(&mut self, r#type: String, filters: HashMap<String, Value>, hydrate: bool) -> io::Result<Vec<Value>> {
+        match self.send_request(Request::Query { r#type, filters, hydrate: Some(hydrate) }).await? {
             Response::Ok { data: Some(Value::Array(items)) } => Ok(items),
             Response::Ok { data: None } => Ok(vec![]),
             Response::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),

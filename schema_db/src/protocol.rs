@@ -6,9 +6,10 @@ use std::collections::HashMap;
 #[serde(tag = "op")]
 pub enum Request {
     Insert { data: Value },
-    GetById { id: String },
-    GetByType { r#type: String },
-    Query { r#type: String, filters: HashMap<String, Value> },
+    BatchInsert { data: Vec<Value> },
+    GetById { id: String, hydrate: Option<bool> },
+    GetByType { r#type: String, hydrate: Option<bool> },
+    Query { r#type: String, filters: HashMap<String, Value>, hydrate: Option<bool> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]

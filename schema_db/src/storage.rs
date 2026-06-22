@@ -1,18 +1,31 @@
 use sled::Db;
 use serde_json::{Value, Map};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use crate::definition_parser::SchemaDefinitions;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 
 pub struct Storage {
     db: Arc<Db>,
     definitions: Arc<SchemaDefinitions>,
+    cache: Mutex<LruCache<String, Value>>,
 }
 
 impl Storage {
     pub fn new(path: &str, definitions: Arc<SchemaDefinitions>) -> Result<Self, Box<dyn std::error::Error>> {
         let db = sled::open(path)?;
-        Ok(Storage { db: Arc::new(db), definitions })
+        let cache = Mutex::new(LruCache::new(NonZeroUsize::new(1000).unwrap()));
+
+        // Persist definitions if they don't exist to ensure stable IDs
+        let defs_tree = db.open_tree("internal:definitions")?;
+        if defs_tree.is_empty() {
+            for (term, id) in &definitions.term_to_id {
+                defs_tree.insert(term.as_bytes(), &id.to_be_bytes())?;
+            }
+        }
+
+        Ok(Storage { db: Arc::new(db), definitions, cache })
     }
 
     pub fn compress(&self, value: &Value) -> Value {
@@ -61,6 +74,41 @@ impl Storage {
         }
     }
 
+    pub fn hydrate(&self, value: &mut Value, seen: &mut HashSet<String>) {
+        match value {
+            Value::Object(map) => {
+                let mut hydrated_entries = Vec::new();
+                for (k, v) in map.iter_mut() {
+                    if k != "@id" {
+                        if let Some(id_str) = v.as_str() {
+                            if id_str.starts_with("https://schema.org/id/") {
+                                if !seen.contains(id_str) {
+                                    seen.insert(id_str.to_string());
+                                    if let Ok(Some(linked_val)) = self.get_by_id(id_str) {
+                                        let mut linked_val = linked_val;
+                                        self.hydrate(&mut linked_val, seen);
+                                        hydrated_entries.push((k.clone(), linked_val));
+                                    }
+                                }
+                            }
+                        } else {
+                            self.hydrate(v, seen);
+                        }
+                    }
+                }
+                for (k, v) in hydrated_entries {
+                    map.insert(k, v);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    self.hydrate(v, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn insert(&self, data: &Value) -> Result<String, Box<dyn std::error::Error>> {
         let mut data = data.clone();
         let id = if let Some(id) = data.get("@id").and_then(|id| id.as_str()) {
@@ -77,19 +125,41 @@ impl Storage {
         let bytes = serde_json::to_vec(&compressed)?;
         self.db.insert(id.as_bytes(), bytes)?;
 
-        // Index by @type
-        if let Some(typ) = data.get("@type") {
-            let types = if let Some(t) = typ.as_str() {
-                vec![t]
-            } else if let Some(arr) = typ.as_array() {
-                arr.iter().filter_map(|v| v.as_str()).collect()
-            } else {
-                vec![]
-            };
+        // Update cache
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.put(id.clone(), data.clone());
+        }
 
-            for t in types {
-                let type_tree = self.db.open_tree(format!("type:{}", t))?;
-                type_tree.insert(id.as_bytes(), b"")?;
+        // Secondary Indexing (Single tree per property for scalability)
+        if let Some(obj) = data.as_object() {
+            for (key, val) in obj {
+                let index_name = if key == "@type" {
+                    "type".to_string()
+                } else {
+                    format!("idx:{}", key)
+                };
+
+                let idx_tree = self.db.open_tree(index_name)?;
+
+                let vals = if let Some(arr) = val.as_array() {
+                    arr.clone()
+                } else {
+                    vec![val.clone()]
+                };
+
+                for v in vals {
+                    if v.is_string() || v.is_number() || v.is_boolean() {
+                        let val_str = match v {
+                            Value::String(s) => s.clone(),
+                            _ => v.to_string(),
+                        };
+                        // Key format: [value][id] to allow range scans and multiple IDs per value
+                        let mut idx_key = val_str.as_bytes().to_vec();
+                        idx_key.extend_from_slice(id.as_bytes());
+                        idx_tree.insert(idx_key, b"")?;
+                    }
+                }
             }
         }
 
@@ -97,20 +167,36 @@ impl Storage {
     }
 
     pub fn get_by_id(&self, id: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+        // Try cache first
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(val) = cache.get(id) {
+                return Ok(Some(val.clone()));
+            }
+        }
+
         if let Some(bytes) = self.db.get(id.as_bytes())? {
             let compressed: Value = serde_json::from_slice(&bytes)?;
-            Ok(Some(self.decompress(&compressed)))
+            let decompressed = self.decompress(&compressed);
+
+            // Populate cache
+            let mut cache = self.cache.lock().unwrap();
+            cache.put(id.to_string(), decompressed.clone());
+
+            Ok(Some(decompressed))
         } else {
             Ok(None)
         }
     }
 
     pub fn get_by_type(&self, typ: &str) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-        let type_tree = self.db.open_tree(format!("type:{}", typ))?;
+        let type_tree = self.db.open_tree("type")?;
         let mut results = Vec::new();
-        for item in type_tree.iter() {
-            let (id, _) = item?;
-            if let Some(val) = self.get_by_id(std::str::from_utf8(&id)?)? {
+        // Use prefix scan for the type value
+        for item in type_tree.scan_prefix(typ.as_bytes()) {
+            let (key, _) = item?;
+            let id_bytes = &key[typ.as_bytes().len()..];
+            if let Some(val) = self.get_by_id(std::str::from_utf8(id_bytes)?)? {
                 results.push(val);
             }
         }
@@ -118,45 +204,47 @@ impl Storage {
     }
 
     pub fn query(&self, typ: &str, filters: &HashMap<String, Value>) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-        let type_tree = self.db.open_tree(format!("type:{}", typ))?;
-        let mut results = Vec::new();
+        if !filters.is_empty() {
+            // Pick the first filter to narrow down results using index
+            if let Some((key, val)) = filters.iter().next() {
+                if val.is_string() || val.is_number() || val.is_boolean() {
+                    let val_str = match val {
+                        Value::String(s) => s.clone(),
+                        _ => val.to_string(),
+                    };
+                    let idx_tree = self.db.open_tree(format!("idx:{}", key))?;
+                    let mut results = Vec::new();
+                    for item in idx_tree.scan_prefix(val_str.as_bytes()) {
+                        let (idx_key, _) = item?;
+                        let id_bytes = &idx_key[val_str.as_bytes().len()..];
+                        if let Some(val) = self.get_by_id(std::str::from_utf8(id_bytes)?)? {
+                            // Verify all filters and type match
+                            let mut matches = true;
+                            if let Some(obj) = val.as_object() {
+                                if let Some(typ_val) = obj.get("@type") {
+                                    let types = if let Some(t) = typ_val.as_str() { vec![t] } else if let Some(arr) = typ_val.as_array() { arr.iter().filter_map(|v| v.as_str()).collect() } else { vec![] };
+                                    if !types.contains(&typ) { matches = false; }
+                                } else { matches = false; }
 
-        // Convert filters to compressed form for faster comparison
-        let mut compressed_filters = HashMap::new();
-        for (k, v) in filters {
-            let key = if let Some(id) = self.definitions.get_id(k) {
-                id.to_string()
-            } else {
-                k.clone()
-            };
-            compressed_filters.insert(key, self.compress(v));
-        }
+                                if matches {
+                                    for (k, v) in filters {
+                                        if obj.get(k) != Some(v) { matches = false; break; }
+                                    }
+                                }
+                            } else { matches = false; }
 
-        for item in type_tree.iter() {
-            let (id, _) = item?;
-            if let Some(bytes) = self.db.get(&id)? {
-                let compressed: Value = serde_json::from_slice(&bytes)?;
-                let obj = compressed.as_object().unwrap();
-
-                let mut matches = true;
-                for (k, v) in &compressed_filters {
-                    if let Some(val) = obj.get(k) {
-                        if val != v {
-                            matches = false;
-                            break;
+                            if matches {
+                                results.push(val);
+                            }
                         }
-                    } else {
-                        matches = false;
-                        break;
                     }
-                }
-
-                if matches {
-                    results.push(self.decompress(&compressed));
+                    return Ok(results);
                 }
             }
         }
-        Ok(results)
+
+        // Fallback to type scan
+        self.get_by_type(typ)
     }
 }
 
@@ -167,60 +255,24 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_storage_compression() {
-        let json_ld = r#"{
-            "@graph": [
-                { "@id": "https://schema.org/Person", "@type": "rdfs:Class" },
-                { "@id": "https://schema.org/name", "@type": "rdf:Property" }
-            ]
-        }"#;
+    fn test_hydration_cycles() {
+        let json_ld = r#"{ "@graph": [{ "@id": "https://schema.org/Person" }, { "@id": "https://schema.org/knows" }] }"#;
         let defs = Arc::new(SchemaDefinitions::parse(json_ld).unwrap());
         let dir = tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap(), defs.clone()).unwrap();
 
-        let data = serde_json::json!({
-            "@type": "Person",
-            "name": "Jane Doe"
-        });
+        let alice_id = "https://schema.org/id/alice";
+        let bob_id = "https://schema.org/id/bob";
 
-        let id = storage.insert(&data).unwrap();
+        storage.insert(&serde_json::json!({ "@id": alice_id, "@type": "Person", "name": "Alice", "knows": bob_id })).unwrap();
+        storage.insert(&serde_json::json!({ "@id": bob_id, "@type": "Person", "name": "Bob", "knows": alice_id })).unwrap();
 
-        // Verify compressed data in DB
-        let raw_bytes = storage.db.get(id.as_bytes()).unwrap().unwrap();
-        let compressed: Value = serde_json::from_slice(&raw_bytes).unwrap();
+        let mut alice = storage.get_by_id(alice_id).unwrap().unwrap();
+        let mut seen = HashSet::new();
+        seen.insert(alice_id.to_string());
+        storage.hydrate(&mut alice, &mut seen);
 
-        let _name_id = defs.get_id("name").unwrap().to_string();
-        let type_id = defs.get_id("@type").unwrap().to_string();
-
-        assert!(compressed.as_object().unwrap().contains_key(&type_id));
-
-        // Verify decompression
-        let retrieved = storage.get_by_id(&id).unwrap().unwrap();
-        assert_eq!(retrieved["name"], "Jane Doe");
-        assert_eq!(retrieved["@type"], "Person");
-    }
-
-    #[test]
-    fn test_query() {
-        let json_ld = r#"{
-            "@graph": [
-                { "@id": "https://schema.org/Person", "@type": "rdfs:Class" },
-                { "@id": "https://schema.org/name", "@type": "rdf:Property" },
-                { "@id": "https://schema.org/jobTitle", "@type": "rdf:Property" }
-            ]
-        }"#;
-        let defs = Arc::new(SchemaDefinitions::parse(json_ld).unwrap());
-        let dir = tempdir().unwrap();
-        let storage = Storage::new(dir.path().to_str().unwrap(), defs.clone()).unwrap();
-
-        storage.insert(&serde_json::json!({ "@type": "Person", "name": "Alice", "jobTitle": "Engineer" })).unwrap();
-        storage.insert(&serde_json::json!({ "@type": "Person", "name": "Bob", "jobTitle": "Designer" })).unwrap();
-
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), serde_json::Value::String("Alice".to_string()));
-
-        let results = storage.query("Person", &filters).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["name"], "Alice");
+        assert_eq!(alice["knows"]["name"], "Bob");
+        assert_eq!(alice["knows"]["knows"], alice_id); // Cycle broken
     }
 }

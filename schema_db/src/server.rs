@@ -5,10 +5,11 @@ use crate::protocol::{Request, Response};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::collections::HashSet;
 
 const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10MB limit
 
-pub async fn handle_client(stream: TcpStream, storage: Arc<Storage>, definitions: Arc<SchemaDefinitions>) {
+pub async fn handle_client(mut stream: TcpStream, storage: Arc<Storage>, definitions: Arc<SchemaDefinitions>) {
     let (mut reader, mut writer) = stream.into_split();
 
     loop {
@@ -56,21 +57,80 @@ pub async fn handle_client(stream: TcpStream, storage: Arc<Storage>, definitions
                     }
                 }
             }
-            Request::GetById { id } => {
+            Request::BatchInsert { data } => {
+                let validator = SchemaValidator::new(&definitions);
+                let mut ids = Vec::new();
+                let mut error = None;
+                for item in data {
+                    if let Err(e) = validator.validate(&item) {
+                        error = Some(e);
+                        break;
+                    }
+                    match storage.insert(&item) {
+                        Ok(id) => ids.push(serde_json::Value::String(id)),
+                        Err(e) => {
+                            error = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = error {
+                    Response::Error { message: e }
+                } else {
+                    Response::Ok { data: Some(serde_json::Value::Array(ids)) }
+                }
+            }
+            Request::GetById { id, hydrate } => {
                 match storage.get_by_id(&id) {
-                    Ok(data) => Response::Ok { data },
+                    Ok(data) => {
+                        let mut val = data;
+                        if let Some(true) = hydrate {
+                            if let Some(ref mut v) = val {
+                                let mut seen = HashSet::new();
+                                if let Some(id) = v.get("@id").and_then(|i| i.as_str()) {
+                                    seen.insert(id.to_string());
+                                }
+                                storage.hydrate(v, &mut seen);
+                            }
+                        }
+                        Response::Ok { data: val }
+                    }
                     Err(e) => Response::Error { message: e.to_string() },
                 }
             }
-            Request::GetByType { r#type } => {
+            Request::GetByType { r#type, hydrate } => {
                 match storage.get_by_type(&r#type) {
-                    Ok(items) => Response::Ok { data: Some(serde_json::Value::Array(items)) },
+                    Ok(items) => {
+                        let mut items = items;
+                        if let Some(true) = hydrate {
+                            for item in &mut items {
+                                let mut seen = HashSet::new();
+                                if let Some(id) = item.get("@id").and_then(|i| i.as_str()) {
+                                    seen.insert(id.to_string());
+                                }
+                                storage.hydrate(item, &mut seen);
+                            }
+                        }
+                        Response::Ok { data: Some(serde_json::Value::Array(items)) }
+                    }
                     Err(e) => Response::Error { message: e.to_string() },
                 }
             }
-            Request::Query { r#type, filters } => {
+            Request::Query { r#type, filters, hydrate } => {
                 match storage.query(&r#type, &filters) {
-                    Ok(items) => Response::Ok { data: Some(serde_json::Value::Array(items)) },
+                    Ok(items) => {
+                        let mut items = items;
+                        if let Some(true) = hydrate {
+                            for item in &mut items {
+                                let mut seen = HashSet::new();
+                                if let Some(id) = item.get("@id").and_then(|i| i.as_str()) {
+                                    seen.insert(id.to_string());
+                                }
+                                storage.hydrate(item, &mut seen);
+                            }
+                        }
+                        Response::Ok { data: Some(serde_json::Value::Array(items)) }
+                    }
                     Err(e) => Response::Error { message: e.to_string() },
                 }
             }

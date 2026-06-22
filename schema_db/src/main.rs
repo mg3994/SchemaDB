@@ -6,13 +6,10 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Fetching latest Schema.org definitions...");
-    let schema_json = reqwest::get("https://schema.org/version/latest/schemaorg-current-https.jsonld")
-        .await?
-        .text()
-        .await?;
+    let cache_path = "schema_cache.json";
+    let url = "https://schema.org/version/latest/schemaorg-current-https.jsonld";
 
-    let definitions = Arc::new(SchemaDefinitions::parse(&schema_json)?);
+    let definitions = Arc::new(SchemaDefinitions::fetch_or_load_cache(cache_path, url).await?);
     let storage = Arc::new(Storage::new("./schema_db_data", definitions.clone())?);
 
     let addr = "127.0.0.1:8888";
